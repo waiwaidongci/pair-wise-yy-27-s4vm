@@ -20,6 +20,22 @@ python -m unittest discover -s tests -v
 - 每次新增或修改异文都会产生递增修订号和 JSON 快照；提交必须携带 `expected_revision`，旧页面不能覆盖新层。
 - 锁定段落由负责人执行，锁定后任何新修订都会被拒绝。
 
+## 审定记录
+
+- 有版本编辑权限的人可以送审版本异文，负责人可代编辑送审；同一条异文只能有一条待审记录。
+- 具备项目 `review` 权限的审阅人查看原句、对齐句、拟句与理由后选择 `approved`（通过）或 `returned`（退回），两种结论都必须写明意见。
+- 退回的改动需先修订异文才能再次送审；通过后内容即为该版本的定本，定本异文不能再修改。
+- 段落锁定前，所有异文都必须有带意见的通过记录；缺意见、仍在待审、被退回或送审被撤回时都不能锁定。
+- 负责人可以撤回尚未审阅的送审，撤回后需重新送审。
+- 项目页按待审（`pending`）、退回（`returned`）、已通过（`approved`）分组列出记录，并附 `withdrawn`（已撤回）分组。
+
+## 审定接口
+
+- `POST /api/variants/{id}/reviews`：送审异文（`user_id`）
+- `POST /api/reviews/{id}/decision`：审定（`user_id`、`action=approved|returned`、`comment`）
+- `POST /api/reviews/{id}/withdraw`：负责人撤回待审送审
+- `GET /api/works/{id}/reviews?user_id=...`：按状态分组列出审定记录
+
 ## 主要接口
 
 - `POST /api/users`、`POST /api/works`
