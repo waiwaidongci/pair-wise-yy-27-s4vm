@@ -144,6 +144,23 @@ class CollationDB:
               reason TEXT NOT NULL DEFAULT '',
               locked_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS reviews (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              work_id INTEGER NOT NULL REFERENCES works(id) ON DELETE CASCADE,
+              passage_id INTEGER NOT NULL REFERENCES passages(id) ON DELETE CASCADE,
+              variant_id INTEGER NOT NULL REFERENCES variants(id) ON DELETE CASCADE,
+              layer INTEGER NOT NULL,
+              base_text TEXT NOT NULL,
+              proposed_text TEXT NOT NULL,
+              reason TEXT NOT NULL,
+              submitted_by INTEGER NOT NULL REFERENCES users(id),
+              on_behalf_of INTEGER REFERENCES users(id),
+              status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','approved','returned','withdrawn')),
+              reviewer_id INTEGER REFERENCES users(id),
+              opinion TEXT NOT NULL DEFAULT '',
+              created_at TEXT NOT NULL,
+              reviewed_at TEXT
+            );
             """
         )
         self.conn.commit()
@@ -153,10 +170,12 @@ class CollationDB:
             return
         owner = self.add_user("项目负责人", "owner")
         editor = self.add_user("校勘编辑", "editor")
+        reviewer = self.add_user("审定专家", "reviewer")
         work = self.create_work("一则残卷", "演示不同版本的校勘", owner)
         w1 = self.add_witness(work, "甲本", "version", "馆藏胶片", "")
         w2 = self.add_witness(work, "乙本", "fragment", "残片转录", "第二句残损")
         self.grant_witness_editor(w2, editor, owner)
+        self.grant_work_access(work, reviewer, "review", owner)
         passage = self.add_passage(work, "第1节", "春水东流，故人南去。", owner)
         self.align_passage(passage, w1, "春水东流，故人南去。", 1, owner)
         self.align_passage(passage, w2, "春水东流，[不可辨][不可辨]。", 2, owner)
@@ -221,6 +240,14 @@ class CollationDB:
         owner = self.conn.execute("SELECT 1 FROM works WHERE id=? AND owner_id=?", (row["work_id"], user_id)).fetchone()
         editor = self.conn.execute("SELECT 1 FROM witness_editors WHERE witness_id=? AND user_id=?", (witness_id, user_id)).fetchone()
         return bool(owner or editor)
+
+    def can_review_work(self, work_id: int, user_id: int) -> bool:
+        if self.conn.execute("SELECT 1 FROM works WHERE id=? AND owner_id=?", (work_id, user_id)).fetchone():
+            return True
+        return bool(self.conn.execute(
+            "SELECT 1 FROM work_access WHERE work_id=? AND user_id=? AND permission='review'",
+            (work_id, user_id),
+        ).fetchone())
 
     def add_witness(self, work_id: int, siglum: str, kind: str, source_note: str = "", missing_sections: str = "") -> int:
         if not self.conn.execute("SELECT 1 FROM works WHERE id=?", (work_id,)).fetchone():
@@ -310,6 +337,8 @@ class CollationDB:
             variant = self.conn.execute("SELECT * FROM variants WHERE id=?", (variant_id,)).fetchone()
             if not variant:
                 raise DomainError("异文记录不存在")
+            if self.conn.execute("SELECT 1 FROM reviews WHERE variant_id=? AND status='pending'", (variant_id,)).fetchone():
+                raise DomainError("该异文正在待审，不能修改")
             passage, _ = self._editable_passage(variant["passage_id"], variant["witness_id"], user_id, expected_revision)
             text = validate_transcription(proposed_text)
             if len(reason.strip()) < 3:
@@ -372,12 +401,106 @@ class CollationDB:
         if not passage:
             raise DomainError("段落不存在")
         self._require_owner(passage["work_id"], user_id)
+        if self.conn.execute("SELECT 1 FROM reviews WHERE passage_id=? AND status='pending'", (passage_id,)).fetchone():
+            raise DomainError("仍有待审的送审记录，不能锁定")
+        if self.conn.execute(
+            "SELECT 1 FROM reviews WHERE passage_id=? AND status IN ('approved','returned') AND opinion=''", (passage_id,)
+        ).fetchone():
+            raise DomainError("有审定记录缺少意见，不能锁定")
+        if not self.conn.execute("SELECT 1 FROM reviews WHERE passage_id=? AND status='approved'", (passage_id,)).fetchone():
+            raise DomainError("段落锁定前需要至少一条通过的审定")
         with self.transaction():
             self.conn.execute("UPDATE passages SET status='locked',updated_by=?,updated_at=? WHERE id=?", (user_id, datetime.now().isoformat(), passage_id))
             self.conn.execute(
                 "INSERT OR REPLACE INTO passage_locks(passage_id,locked_by,reason,locked_at) VALUES(?,?,?,?)",
                 (passage_id, user_id, reason.strip(), datetime.now().isoformat()),
             )
+
+    REVIEW_DECISIONS = {"approved": "approved", "returned": "returned", "通过": "approved", "退回": "returned"}
+
+    def submit_review(self, variant_id: int, user_id: int, on_behalf_of: int | None = None) -> int:
+        variant = self.conn.execute("SELECT * FROM variants WHERE id=?", (variant_id,)).fetchone()
+        if not variant:
+            raise DomainError("异文记录不存在")
+        passage = self.conn.execute("SELECT * FROM passages WHERE id=?", (variant["passage_id"],)).fetchone()
+        if passage["status"] == "locked" or self.conn.execute("SELECT 1 FROM passage_locks WHERE passage_id=?", (passage["id"],)).fetchone():
+            raise DomainError("段落已锁定，不能送审")
+        work_id = passage["work_id"]
+        if on_behalf_of is not None:
+            self._require_owner(work_id, user_id)
+            if not self.can_edit_witness(variant["witness_id"], on_behalf_of):
+                raise DomainError("被代送的用户没有该版本的编辑权限")
+        elif not self.can_edit_witness(variant["witness_id"], user_id):
+            raise DomainError("无权送审该版本异文")
+        if self.conn.execute("SELECT 1 FROM reviews WHERE variant_id=? AND status='pending'", (variant_id,)).fetchone():
+            raise DomainError("该异文已有待审的送审记录")
+        latest = self.conn.execute(
+            "SELECT * FROM reviews WHERE variant_id=? AND status!='withdrawn' ORDER BY id DESC LIMIT 1", (variant_id,)
+        ).fetchone()
+        if latest and latest["layer"] == variant["layer"]:
+            if latest["status"] == "returned":
+                raise DomainError("退回的改动须先修订再送审")
+            if latest["status"] == "approved":
+                raise DomainError("该异文当前内容已通过审定")
+        with self.transaction():
+            cur = self.conn.execute(
+                "INSERT INTO reviews(work_id,passage_id,variant_id,layer,base_text,proposed_text,reason,submitted_by,on_behalf_of,created_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (work_id, passage["id"], variant_id, variant["layer"], variant["base_text"], variant["proposed_text"],
+                 variant["reason"], user_id, on_behalf_of, datetime.now().isoformat()),
+            )
+        return int(cur.lastrowid)
+
+    def decide_review(self, review_id: int, user_id: int, decision: str, opinion: str) -> str:
+        review = self.conn.execute("SELECT * FROM reviews WHERE id=?", (review_id,)).fetchone()
+        if not review:
+            raise DomainError("送审记录不存在")
+        if not self.can_review_work(review["work_id"], user_id):
+            raise DomainError("无权审定该送审")
+        if review["status"] != "pending":
+            raise DomainError("该送审已审结或已撤回")
+        status = self.REVIEW_DECISIONS.get(decision.strip())
+        if not status:
+            raise DomainError("审定结论必须为通过或退回")
+        if not opinion.strip():
+            raise DomainError("审定意见不能为空")
+        with self.transaction():
+            self.conn.execute(
+                "UPDATE reviews SET status=?,reviewer_id=?,opinion=?,reviewed_at=? WHERE id=?",
+                (status, user_id, opinion.strip(), datetime.now().isoformat(), review_id),
+            )
+        return status
+
+    def withdraw_review(self, review_id: int, user_id: int) -> None:
+        review = self.conn.execute("SELECT * FROM reviews WHERE id=?", (review_id,)).fetchone()
+        if not review:
+            raise DomainError("送审记录不存在")
+        self._require_owner(review["work_id"], user_id)
+        if review["status"] != "pending":
+            raise DomainError("只有尚未审阅的送审可以撤回")
+        with self.transaction():
+            self.conn.execute("UPDATE reviews SET status='withdrawn' WHERE id=?", (review_id,))
+
+    def list_reviews(self, work_id: int, user_id: int) -> dict:
+        if not self.can_view_work(work_id, user_id):
+            raise DomainError("无权查看该校勘项目")
+        rows = self.conn.execute(
+            "SELECT r.*,p.label AS passage_label,w.siglum,su.name AS submitted_by_name,"
+            "ou.name AS on_behalf_of_name,ru.name AS reviewer_name "
+            "FROM reviews r "
+            "JOIN passages p ON p.id=r.passage_id "
+            "JOIN variants v ON v.id=r.variant_id "
+            "JOIN witnesses w ON w.id=v.witness_id "
+            "JOIN users su ON su.id=r.submitted_by "
+            "LEFT JOIN users ou ON ou.id=r.on_behalf_of "
+            "LEFT JOIN users ru ON ru.id=r.reviewer_id "
+            "WHERE r.work_id=? ORDER BY r.id DESC",
+            (work_id,),
+        ).fetchall()
+        groups = {"pending": [], "returned": [], "approved": [], "withdrawn": []}
+        for row in rows:
+            groups[row["status"]].append(dict(row))
+        return {"work_id": work_id, "counts": {k: len(v) for k, v in groups.items()}, **groups}
 
     def get_snapshot(self, passage_id: int, revision_no: int, user_id: int) -> dict:
         passage = self.conn.execute("SELECT work_id FROM passages WHERE id=?", (passage_id,)).fetchone()
@@ -410,6 +533,11 @@ class CollationDB:
             for row in self.conn.execute("SELECT * FROM variants WHERE passage_id=? ORDER BY witness_id,layer,id", (passage["id"],)).fetchall():
                 variant = dict(row)
                 variant["notes"] = [dict(r) for r in self.conn.execute("SELECT * FROM notes WHERE variant_id=? ORDER BY id", (row["id"],))]
+                review = self.conn.execute(
+                    "SELECT * FROM reviews WHERE variant_id=? AND status!='withdrawn' ORDER BY id DESC LIMIT 1", (row["id"],)
+                ).fetchone()
+                variant["review"] = dict(review) if review else None
+                variant["is_definitive"] = bool(review and review["status"] == "approved" and review["layer"] == row["layer"])
                 variants.append(variant)
             passages.append({**dict(passage), "alignments": alignments, "variants": variants})
         return {"work": dict(work), "witnesses": witnesses, "passages": passages, "gap_count": gaps}
